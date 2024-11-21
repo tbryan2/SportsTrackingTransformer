@@ -7,14 +7,13 @@ splitting it into train, validation, and test sets.
 
 Functions:
     get_players_df: Load and preprocess player data
-    get_plays_df: Load and preprocess play data
+    get_plays_df: Load and preprocess play data with coverage mapping
     get_tracking_df: Load and preprocess tracking data
     add_features_to_tracking_df: Add derived features to tracking data
     convert_tracking_to_cartesian: Convert polar coordinates to Cartesian
     standardize_tracking_directions: Standardize play directions
     augment_mirror_tracking: Augment data by mirroring the field
-    add_relative_positions: Add relative position features
-    get_tackle_loc_target_df: Generate target dataframe for tackle location prediction
+    get_coverage_target_df: Generate target dataframe for coverage classification
     split_train_test_val: Split data into train, validation, and test sets
     main: Main execution function
 
@@ -25,7 +24,30 @@ from pathlib import Path
 
 import polars as pl
 
-INPUT_DATA_DIR = Path("data/bdb_2024/")
+INPUT_DATA_DIR = Path("../data/")
+
+# Remap dictionary for coverage types
+REMAPPING_DICT = {
+    'Cover-3 Double Cloud': 'Cover-3',
+    'Miscellaneous': 'Misc',
+    'Cover-3 Cloud Left': 'Cover-3',
+    'Cover-3 Cloud Right': 'Cover-3',
+    'Prevent': 'Prevent',
+    'Cover-1 Double': 'Cover-1',
+    'Bracket': 'Bracket',
+    'Goal Line': 'Goal Line',
+    '2-Man': '2-Man',
+    'NA': 'Misc',
+    'Red Zone': 'Red Zone',
+    'Cover-0': 'Cover-0',
+    'Cover-3 Seam': 'Cover-3',
+    'Cover-6 Right': 'Cover-6',
+    'Cover 6-Left': 'Cover-6',
+    'Cover-2': 'Cover-2',
+    'Quarters': 'Quarters',
+    'Cover-1': 'Cover-1',
+    'Cover-3': 'Cover-3'
+}
 
 
 def get_players_df() -> pl.DataFrame:
@@ -51,18 +73,25 @@ def get_players_df() -> pl.DataFrame:
 
 def get_plays_df() -> pl.DataFrame:
     """
-    Load play-level data and preprocesses features.
+    Load play-level data, preprocess features, and map coverage types.
 
     Returns:
-        pl.DataFrame: Preprocessed play data with additional features.
+        pl.DataFrame: Preprocessed play data with additional features and remapped coverage types.
     """
-    return pl.read_csv(INPUT_DATA_DIR / "plays.csv", null_values=["NA", "nan", "N/A", "NaN", ""]).with_columns(
+    plays_df = pl.read_csv(INPUT_DATA_DIR / "plays.csv", null_values=["NA", "nan", "N/A", "NaN", ""]).with_columns(
         distanceToGoal=(
             pl.when(pl.col("possessionTeam") == pl.col("yardlineSide"))
             .then(100 - pl.col("yardlineNumber"))
             .otherwise(pl.col("yardlineNumber"))
         )
     )
+    
+    # Remap pff_passCoverage using the provided dictionary
+    plays_df = plays_df.with_columns(
+        coverage=pl.col("pff_passCoverage").replace(REMAPPING_DICT).fill_null("Misc")
+    )
+    
+    return plays_df
 
 
 def get_tracking_df() -> pl.DataFrame:
@@ -94,19 +123,17 @@ def add_features_to_tracking_df(
     Returns:
         pl.DataFrame: Tracking data with additional features.
     """
-    # add `is_ball_carrier`, `team_indicator`, and other features to tracking data
     og_len = len(tracking_df)
     tracking_df = (
         tracking_df.join(
             plays_df.select(
                 "gameId",
                 "playId",
-                "ballCarrierId",
-                "possessionTeam",
+                "coverage",
                 "down",
+                "possessionTeam",
                 "yardsToGo",
-                "distanceToGoal",
-                "playResult",
+                "distanceToGoal"
             ),
             on=["gameId", "playId"],
             how="inner",
@@ -117,13 +144,12 @@ def add_features_to_tracking_df(
             how="inner",
         )
         .with_columns(
-            is_ball_carrier=(pl.col("nflId") == pl.col("ballCarrierId")).cast(int),
             side=pl.when(pl.col("club") == pl.col("possessionTeam"))
             .then(pl.lit(1))
             .otherwise(pl.lit(-1))
             .alias("side"),
         )
-        .drop(["ballCarrierId", "possessionTeam"])
+        .drop(["possessionTeam"])
     )
     assert len(tracking_df) == og_len, "Lost rows when joining tracking data with play/player data"
 
@@ -209,81 +235,54 @@ def augment_mirror_tracking(tracking_df: pl.DataFrame) -> pl.DataFrame:
     return tracking_df
 
 
-def get_tackle_loc_target_df(tracking_df: pl.DataFrame) -> pl.DataFrame:
+def get_coverage_target_df(tracking_df: pl.DataFrame, plays_df: pl.DataFrame) -> pl.DataFrame:
     """
-    Generate target dataframe for tackle location prediction.
+    Generate target dataframe for defensive coverage classification.
 
     Args:
         tracking_df (pl.DataFrame): Tracking data
+        plays_df (pl.DataFrame): Play data
 
     Returns:
-        tuple: tuple containing tackle location target dataframe and filtered tracking data.
+        pl.DataFrame: Target dataframe with coverage labels.
     """
-    # generate per-play target dataframe
-    TACKLE_EVENTS = ["tackle", "out_of_bounds", "touchdown", "qb_slide", "fumble"]
+    # Select unique play identifiers with mirrored from tracking_df
+    unique_play_mirrored = tracking_df.select(["gameId", "playId", "mirrored"]).unique()
 
-    # get the tackle location for each play as the ball carrier's location at the frame of the tackle
-    play_tackle_loc_df = (
-        tracking_df.sort("frameId")
-        .filter(pl.col("event").is_in(TACKLE_EVENTS) & (pl.col("is_ball_carrier") == 1))
-        .group_by(["gameId", "playId", "mirrored"])
-        .tail(1)
-        .select(
-            [
-                "gameId",
-                "playId",
-                "mirrored",
-                "nflId",
-                "displayName",
-                "frameId",
-                "event",
-                "x",
-                "y",
-                "playResult",
-            ]
-        )
-        .rename(
-            {
-                "nflId": "ballCarrierNflId",
-                "displayName": "ballCarrierName",
-                "frameId": "tackle_frameId",
-                "event": "tackle_event",
-                "x": "tackle_x",
-                "y": "tackle_y",
-            }
-        )
+    # Join with plays_df to get coverage
+    coverage_df = unique_play_mirrored.join(
+        plays_df.select(["gameId", "playId", "coverage"]),
+        on=["gameId", "playId"],
+        how="left"  # Use left join to retain all mirrored plays
+    ).with_columns(
+        coverage=pl.col("coverage").fill_null("Misc")  # Handle any missing coverage
     )
 
-    # we need to convert into relative coordinates which involves comparing against the
-    # anchor point which is per frame
-    tackle_loc_df = (
-        play_tackle_loc_df.join(
-            tracking_df.select(["gameId", "playId", "mirrored", "frameId", "anchor_x", "anchor_y"]).unique(),
-            on=["gameId", "playId", "mirrored"],
-            how="inner",
-        ).with_columns(
-            tackle_x_rel=pl.col("tackle_x") - pl.col("anchor_x"),
-            tackle_y_rel=pl.col("tackle_y") - pl.col("anchor_y"),
+    # Verify if any coverage is still null
+    null_coverage_count = coverage_df.filter(pl.col("coverage").is_null()).height
+    if null_coverage_count > 0:
+        print(f"Warning: {null_coverage_count} plays have null coverage after join. Filling with 'Misc'.")
+        coverage_df = coverage_df.with_columns(
+            coverage=pl.col("coverage").fill_null("Misc")
         )
-        # .drop(["anchor_x", "anchor_y"])
-    )
 
-    # only keep plays in dataset that have a valid tackle location target
-    og_play_count = len(tracking_df.select(["gameId", "playId"]).unique())
+    # Ensure that tracking_df only includes plays present in coverage_df
+    og_play_count = len(tracking_df.select(["gameId", "playId", "mirrored"]).unique())
     tracking_df = tracking_df.join(
-        tackle_loc_df.select(["gameId", "playId", "mirrored"]).unique(),
+        coverage_df.select(["gameId", "playId", "mirrored"]).unique(),
         on=["gameId", "playId", "mirrored"],
         how="inner",
     )
-    new_play_count = len(tracking_df.select(["gameId", "playId"]).unique())
-    print(f"Lost {(og_play_count - new_play_count)/og_play_count:.3%} plays when joining with tackle_loc_df")
-    return tackle_loc_df, tracking_df
+    new_play_count = len(tracking_df.select(["gameId", "playId", "mirrored"]).unique())
+    print(f"Lost {(og_play_count - new_play_count)/og_play_count:.3%} plays when joining with coverage_df")
+
+    return coverage_df
 
 
 def split_train_test_val(tracking_df: pl.DataFrame, target_df: pl.DataFrame) -> dict[str, pl.DataFrame]:
     """
     Split data into train, validation, and test sets.
-    Split is 70-15-15 for train-test-val respectively. Notably, we split at the play levle and not frame level.
+    Split is 70-15-15 for train-test-val respectively. Notably, we split at the play level and not frame level.
     This ensures no target contamination between splits.
 
     Args:
@@ -298,31 +297,33 @@ def split_train_test_val(tracking_df: pl.DataFrame, target_df: pl.DataFrame) -> 
 
     print(
         f"Total set: {tracking_df.n_unique(['gameId', 'playId', 'mirrored'])} plays,",
-        f"{tracking_df.n_unique(['gameId', 'playId', 'mirrored', "frameId"])} frames",
+        f"{tracking_df.n_unique(['gameId', 'playId', 'mirrored', 'frameId'])} frames",
     )
 
-    test_val_ids = tracking_df.select(["gameId", "playId"]).unique(maintain_order=True).sample(fraction=0.3, seed=42)
-    train_tracking_df = tracking_df.join(test_val_ids, on=["gameId", "playId"], how="anti")
-    train_tgt_df = target_df.join(test_val_ids, on=["gameId", "playId"], how="anti")
+    # Sample 30% of the plays for test and validation
+    test_val_ids = target_df.select(["gameId", "playId", "mirrored"]).unique(maintain_order=True).sample(fraction=0.3, seed=42)
+    train_tracking_df = tracking_df.join(test_val_ids, on=["gameId", "playId", "mirrored"], how="anti")
+    train_tgt_df = target_df.join(test_val_ids, on=["gameId", "playId", "mirrored"], how="anti")
     print(
         f"Train set: {train_tracking_df.n_unique(['gameId', 'playId', 'mirrored'])} plays,",
-        f"{train_tracking_df.n_unique(['gameId', 'playId', 'mirrored', "frameId"])} frames",
+        f"{train_tracking_df.n_unique(['gameId', 'playId', 'mirrored', 'frameId'])} frames",
     )
 
-    test_ids = test_val_ids.sample(fraction=0.5, seed=42)  # 70-15-15 split
-    test_tracking_df = tracking_df.join(test_ids, on=["gameId", "playId"], how="inner")
-    test_tgt_df = target_df.join(test_ids, on=["gameId", "playId"], how="inner")
+    # Split the 30% into test and validation (15% each)
+    test_ids = test_val_ids.sample(fraction=0.5, seed=42)  # 15% for test
+    test_tracking_df = tracking_df.join(test_ids, on=["gameId", "playId", "mirrored"], how="inner")
+    test_tgt_df = target_df.join(test_ids, on=["gameId", "playId", "mirrored"], how="inner")
     print(
         f"Test set: {test_tracking_df.n_unique(['gameId', 'playId', 'mirrored'])} plays,",
-        f"{test_tracking_df.n_unique(['gameId', 'playId', 'mirrored', "frameId"])} frames",
+        f"{test_tracking_df.n_unique(['gameId', 'playId', 'mirrored', 'frameId'])} frames",
     )
 
-    val_ids = test_val_ids.join(test_ids, on=["gameId", "playId"], how="anti")
-    val_tracking_df = tracking_df.join(val_ids, on=["gameId", "playId"], how="inner")
-    val_tgt_df = target_df.join(val_ids, on=["gameId", "playId"], how="inner")
+    val_ids = test_val_ids.join(test_ids, on=["gameId", "playId", "mirrored"], how="anti")
+    val_tracking_df = tracking_df.join(val_ids, on=["gameId", "playId", "mirrored"], how="inner")
+    val_tgt_df = target_df.join(val_ids, on=["gameId", "playId", "mirrored"], how="inner")
     print(
         f"Validation set: {val_tracking_df.n_unique(['gameId', 'playId', 'mirrored'])} plays,",
-        f"{val_tracking_df.n_unique(['gameId', 'playId', 'mirrored', "frameId"])} frames",
+        f"{val_tracking_df.n_unique(['gameId', 'playId', 'mirrored', 'frameId'])} frames",
     )
 
     return {
@@ -333,34 +334,6 @@ def split_train_test_val(tracking_df: pl.DataFrame, target_df: pl.DataFrame) -> 
         "val_features": val_tracking_df,
         "val_targets": val_tgt_df,
     }
-
-
-def add_relative_positions(tracking_df: pl.DataFrame) -> pl.DataFrame:
-    """
-    Normalize x, y position against an anchor point of the ball carrier's location at the first frame of the play.
-
-    This is not done for the purposes of defining a player ordering, as both The Zoo and Transformer are player-order
-    invariant models. This is done primarily for standardizing the data distribution and making frames look more alike
-    each other.
-
-    Args:
-        tracking_df (pl.DataFrame): Tracking data
-
-    Returns:
-        pl.DataFrame: Tracking data with relative position features.
-    """
-    return (
-        tracking_df.sort("frameId")
-        # Use play-level anchor of ball carrier's location at first frame in the play
-        .with_columns(
-            anchor_x=pl.col("x").filter(pl.col("is_ball_carrier") == 1).first().over(["gameId", "playId", "mirrored"]),
-            anchor_y=pl.col("y").filter(pl.col("is_ball_carrier") == 1).first().over(["gameId", "playId", "mirrored"]),
-        )
-        .with_columns(
-            x_rel=pl.col("x") - pl.col("anchor_x"),
-            y_rel=pl.col("y") - pl.col("anchor_y"),
-        )
-    )
 
 
 def main():
@@ -383,18 +356,24 @@ def main():
     tracking_df = standardize_tracking_directions(tracking_df)
     tracking_df = augment_mirror_tracking(tracking_df)
 
-    rel_tracking_df = add_relative_positions(tracking_df)
+    # Removed add_relative_positions as ball carrier is not needed
 
-    tkl_loc_tgt_df, rel_tracking_df = get_tackle_loc_target_df(rel_tracking_df)
+    coverage_tgt_df = get_coverage_target_df(tracking_df, plays_df)
 
-    split_dfs = split_train_test_val(rel_tracking_df, tkl_loc_tgt_df)
+    split_dfs = split_train_test_val(tracking_df, coverage_tgt_df)
 
     out_dir = Path("data/split_prepped_data/")
     out_dir.mkdir(exist_ok=True, parents=True)
 
     for key, df in split_dfs.items():
-        sort_keys = ["gameId", "playId", "mirrored", "frameId"]
-        df.sort(sort_keys).write_parquet(out_dir / f"{key}.parquet")
+        if "targets" in key:
+            # For target dataframes, no frame-level data is needed
+            df = df.select(["gameId", "playId", "mirrored", "coverage"])
+        else:
+            # For feature dataframes, ensure proper sorting
+            sort_keys = ["gameId", "playId", "mirrored", "frameId"]
+            df = df.sort(sort_keys)
+        df.write_parquet(out_dir / f"{key}.parquet")
 
 
 if __name__ == "__main__":
