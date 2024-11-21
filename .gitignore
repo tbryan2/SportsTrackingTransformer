@@ -10,3 +10,4 @@ wheels/
 .venv
 /lines
 src/sandbox.ipynb
+data/

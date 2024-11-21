@@ -5,7 +5,7 @@ description = "Demo repository showcasing Transformer model architecture for spo
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-    "torch==2.3.0",
+    "torch==2.5.0",
     "polars[numpy,pandas,plot,pyarrow,style]>=1.5.0",
     "lightning>=2.4.0",
     "dvc>=3.54.1",
